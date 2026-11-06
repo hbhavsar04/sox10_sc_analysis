@@ -1,0 +1,19 @@
+name: snapatac_native
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - r-base=4.3
+  - r-seurat[version='>=4.3,<5']
+  - r-remotes
+  - r-devtools
+  - r-biocmanager
+  - r-irlba
+  - r-matrix
+  - r-plyr
+  - r-doparallel
+  - r-rann
+  - r-igraph
+  - compilers
+prefix: /Users/msbl/anaconda3/envs/snapatac_native

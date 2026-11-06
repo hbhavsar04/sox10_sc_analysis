@@ -1,0 +1,25 @@
+# data
+data/raw/*
+data/processed/*
+!data/**/.gitkeep
+*.bam
+*.bai
+*.snap
+*.h5
+*.h5ad
+*.rds
+*.RData
+*.tsv.gz
+*.tbi
+*.bed.gz
+*.fa
+*.fa.fai
+
+# R / Python clutter
+.Rhistory
+.Rproj.user/
+__pycache__/
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
