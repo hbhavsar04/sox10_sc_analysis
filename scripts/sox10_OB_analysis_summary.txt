@@ -1,0 +1,758 @@
+===============================================================================
+SEARCHING FOR SPATIALLY RESTRICTED OSTEOBLAST GENES IN A ZEBRAFISH
+NEURAL CREST SINGLE-CELL DATASET: SUMMARY OF ANALYSES AND RESULTS
+===============================================================================
+Project repo: sox10_sc_analysis
+Data: Fabian et al. 2022, Nature Communications 13:13
+      "Lifelong single-cell profiling of cranial neural crest diversification
+       in zebrafish" (Crump lab)
+Last updated: 10 Nov 2026
+
+This document explains, step by step, what was done, why, how (with code
+excerpts), what was found, and what remains open. It is written for a reader
+who knows basic biology but may not be familiar with single-cell genomics.
+A glossary is at the end.
+
+
+-------------------------------------------------------------------------------
+CONTENTS
+-------------------------------------------------------------------------------
+  0. The question
+  1. Background: the data and the key concepts
+  2. Computing environment
+  3. Discovery: the ATAC object already contains imputed expression (script 01)
+  4. Attempt 1: isolate opercle cells with per-cell marker gates (scripts 02-03)
+  5. Defining the osteoblast (OB) population by cluster (script 04)
+  6. Axes of variation within OB nuclei (script 05)
+  7. Reclustering OB nuclei two ways (script 06)
+  8. "Core + partner" genes (script 07)
+  9. Gene modules within mature osteoblasts (script 08)
+ 10. Overall conclusions
+ 11. Current HCR candidate genes
+ 12. Open items and next steps
+ 13. File map
+ 14. Glossary
+
+
+===============================================================================
+0. THE QUESTION
+===============================================================================
+
+Goal: find genes that are expressed in only part of the osteoblast population
+in a spatially organized way ("spatially restricted genes", SRGs), so they can
+be tested by HCR in situ hybridization.
+
+The original aim was the opercle bone specifically. We later widened the search
+to osteoblasts of all craniofacial bones, because the data do not contain enough
+positional information to reliably separate the opercle from other bones. HCR
+imaging will show which bone each gene pattern belongs to.
+
+Important limitation up front: single-cell data have no spatial coordinates.
+Cells are dissociated before sequencing. So every "spatial" candidate in this
+document is a PREDICTION, inferred from which cells share expression programs.
+Only imaging (HCR) can confirm that a gene is spatially restricted.
+
+
+===============================================================================
+1. BACKGROUND: THE DATA AND THE KEY CONCEPTS
+===============================================================================
+
+1.1 What the paper did
+----------------------
+The authors permanently labeled cranial neural crest-derived cells (CNCCs) with
+a Sox10:Cre lineage reporter, dissected zebrafish heads at 7 stages (1.5 dpf to
+adult), sorted the labeled cells, and profiled them two ways:
+
+  - scRNA-seq (single-cell RNA sequencing): measures which genes each cell is
+    transcribing. 58,075 cells total; median 866 genes detected per cell.
+
+  - snATAC-seq (single-nucleus ATAC sequencing): measures which regions of the
+    genome are "open" (accessible) in each nucleus. Open regions include active
+    promoters and enhancers, so this is a readout of each cell's regulatory
+    state. 88,177 nuclei; median ~10,400 DNA fragments per nucleus.
+
+The two assays are done on DIFFERENT cells from the same kind of sample. They
+are not measured in the same cell.
+
+1.2 The "pseudo-multiome" (imputation)
+--------------------------------------
+To combine them, the authors gave every ATAC nucleus an estimated expression
+profile borrowed from the RNA cells. This is called imputation. Their Methods
+describe it; it is standard Seurat "transfer" and works like this:
+
+  Step 1. Gene activity. For each nucleus, count ATAC fragments over each gene
+          body. Open chromatin over a gene roughly suggests the gene is active.
+          This turns chromatin data into something gene-shaped.
+
+  Step 2. Anchors. Put RNA cells and ATAC nuclei into a shared space (using
+          canonical correlation analysis, CCA) and find pairs of an RNA cell and
+          an ATAC nucleus that are each other's closest match ("mutual nearest
+          neighbors"). Each pair is an anchor: "these are probably the same kind
+          of cell."
+
+  Step 3. Transfer. For every ATAC nucleus, find its nearest anchors in the
+          ATAC (chromatin) embedding and take a weighted average of those
+          anchors' RNA cells' expression. That average becomes the nucleus's
+          imputed expression.
+
+Consequences that matter for everything below:
+  - Imputed values are averages of real RNA measurements. They cannot contain
+    expression values that were never measured in some RNA cells.
+  - Averaging SMOOTHS the data: it removes dropout, but also spreads expression
+    between neighboring cells and inflates gene-gene correlations.
+  - What imputation does ADD is organization: nuclei are grouped by measured
+    chromatin, and expression is averaged within those chromatin-defined groups.
+    If chromatin separates cells by position better than RNA does (as the paper
+    showed at 1.5 dpf), imputed expression can reveal positional patterns that
+    the RNA data alone blur.
+
+1.3 Why chromatin can resolve position better than RNA (the paper's claim)
+--------------------------------------------------------------------------
+At 1.5 dpf, positional identity (which arch, dorsal vs ventral) is carried by a
+few lowly expressed transcription factors (hand2, pou3f3b, dlx5a, nr5a2...). In
+scRNA-seq these drop out in single cells and are a small part of total
+variation, so cells from different positions get interleaved. In chromatin,
+position is written into thousands of regulatory elements, so nuclei group by
+position. Averaging RNA expression within those chromatin groups recovered
+clean positional domains, which the authors validated by in situ hybridization.
+
+Whether this advantage also holds WITHIN 5 dpf osteoblasts is one of the things
+this project has been testing.
+
+1.4 Objects we used
+-------------------
+Downloaded from FaceBase as R objects (gunzip first):
+
+  data/raw/3dpf_scRNA.rds              Seurat object, RNA assay
+  data/raw/3dpf_snATAC_SnapATAC.rds    Seurat/Signac object with assays:
+                                         ATAC      peak counts (measured)
+                                         ACTIVITY  imputed expression
+                                         chromvar  motif activity scores
+  (same for 5dpf)
+
+3 dpf RNA object: 6,314 cells x 32,524 genes; reductions pca, umap.
+3 dpf ATAC object: 6,695 nuclei; 445,300 peaks; reductions lsi, umap.
+
+Old (Seurat v3) objects must be updated after loading:
+
+    library(Seurat); library(Signac)
+    rna  <- UpdateSeuratObject(readRDS("data/raw/3dpf_scRNA.rds"))
+    atac <- UpdateSeuratObject(readRDS("data/raw/3dpf_snATAC_SnapATAC.rds"))
+    Assays(atac)   # "ATAC" "ACTIVITY" "chromvar"
+
+
+===============================================================================
+2. COMPUTING ENVIRONMENT
+===============================================================================
+
+Machine: Apple Silicon (M2) Mac.
+
+Exact reproduction of the paper's versions (R 4.0, Seurat 3.2.3, Signac 1.0)
+is impossible natively on Apple Silicon because R 4.0 was never built for ARM.
+We chose newer versions instead, since the goal is the same kind of analysis,
+not identical numbers.
+
+Final working setup (native ARM):
+
+    mamba create -n snapatac_native -c conda-forge -c bioconda --strict-channel-priority \
+      r-base=4.4 r-seurat r-signac r-remotes r-devtools r-biocmanager \
+      r-irlba r-matrix r-plyr r-doparallel r-dosnow r-foreach r-bigmemory r-rann r-igraph \
+      bioconductor-rsamtools bioconductor-genomicalignments bioconductor-biocparallel \
+      bioconductor-rtracklayer bioconductor-bsgenome bioconductor-genomicfeatures \
+      bioconductor-ensembldb bioconductor-rhdf5 bioconductor-chromvar \
+      bioconductor-motifmatchr bioconductor-tfbstools bioconductor-jaspar2020 \
+      bioconductor-bsgenome.drerio.ucsc.danrer11 compilers
+    mamba install -c conda-forge -c bioconda r-terra r-raster r-locfit bioconductor-edger r-plot3d
+
+    # in R:
+    remotes::install_github("r3fang/SnapATAC", upgrade = "never")
+
+Lessons learned:
+  - Bioconductor packages for R 4.3 had no ARM builds; R 4.4 did.
+  - Compiled packages (Rsamtools, terra, locfit...) fail to build from source in
+    conda R on macOS; installing prebuilt conda binaries avoids this.
+  - SnapATAC v1 is unmaintained and has undeclared dependencies (plot3D).
+
+
+===============================================================================
+3. DISCOVERY: THE ATAC OBJECT ALREADY CONTAINS IMPUTED EXPRESSION (script 01)
+===============================================================================
+
+Purpose: before doing our own integration, check what the authors' ACTIVITY
+assay is. Raw SnapATAC gene activity would be integer fragment counts.
+
+Code:
+
+    act <- GetAssayData(atac, assay = "ACTIVITY", layer = "counts")
+    rna_data <- GetAssayData(rna, assay = "RNA", layer = "data")
+
+    all(act@x == round(act@x))                         # integer values?
+    length(act@x) / prod(dim(act))                     # fraction nonzero
+    identical(act, GetAssayData(atac, assay = "ACTIVITY", layer = "data"))
+    cor(Matrix::rowMeans(act), Matrix::rowMeans(rna_data[rownames(act), ]),
+        method = "spearman")
+
+Results (3 dpf):
+  - Not integer valued.
+  - Exactly the same 32,524 genes as the RNA object.
+  - 25% of entries nonzero (much denser than raw scRNA-seq, ~3-5%).
+  - Median 0.07, max 6.7: the log-normalized expression scale.
+  - counts layer identical to data layer.
+  - Gene-mean correlation with RNA: Spearman 0.94.
+
+Interpretation: ACTIVITY is the authors' imputed RNA expression, not raw gene
+activity. The pseudo-multiome was already done, so we used it directly. Running
+our own anchor/transfer on top of it would have been circular (anchoring RNA to
+itself).
+
+
+===============================================================================
+4. ATTEMPT 1: ISOLATE OPERCLE CELLS WITH PER-CELL GATES (scripts 02-03)
+===============================================================================
+
+4.1 Idea
+--------
+The opercle forms from dorsal hyoid (pharyngeal arch 2) neural crest. So an
+opercle osteoblast should be:
+  (a) osteoblast lineage:  runx2a/b, sp7, col10a1a, ifitm5...
+  (b) arch 2:              hox paralog group 2 (hoxa2b, hoxb2a) high,
+                           group 3 (hoxa3a, hoxb3a, hoxd3a) low
+  (c) dorsal:              pou3f3b, jag1b, hey1 higher than hand2, dlx3b, dlx5a
+
+4.2 Method: module scores and gates
+-----------------------------------
+A MODULE SCORE summarizes a gene set per cell. Seurat's AddModuleScore takes
+the average expression of the set minus the average of randomly chosen
+"control" genes with similar expression levels. Positive = above background.
+
+    obj <- AddModuleScore(obj, features = list(c("hoxa2b", "hoxb2a")),
+                          name = "hox2_", assay = "RNA", seed = 1)
+    obj$arch2_score <- obj$hox2_1 - obj$hox3_1
+    obj$is_arch2 <- obj$hox2_1 > 0.1 & obj$arch2_score > 0
+
+A cell was an "opercle candidate" if it passed all three gates. For the ATAC
+object, thresholds were calibrated so the same fraction of cells passed each
+gate as in RNA, because smoothing inflates imputed module scores.
+
+4.3 Results
+-----------
+  - First version: the arch 2 gate passed ~80% of all cells. Hox-negative cells
+    (arch 1, frontonasal) have both hox scores near background, so "hox2 minus
+    hox3 > 0" was true by noise. Fixed by also requiring hox2 itself > 0.1.
+  - After fixing: very few candidates. 3 dpf RNA: 7, 10, 6 cells per replicate
+    (~0.35-0.39%); 3 dpf ATAC: 1 and 7. 5 dpf RNA: 44 and 4; 5 dpf ATAC: 21.
+  - Most cells lighting up for the osteoblast score were excluded because
+    they lacked detectable hox PG2. Either they are osteoblasts of other bones
+    (correct exclusion) or opercle cells whose lowly expressed hox reads dropped
+    out (false negatives). Per-cell data cannot tell these apart.
+  - Script 03 tried to select whole osteoblast clusters instead. At 3 dpf, NO
+    cluster qualified: the most osteoblast-rich cluster had only ~3% of cells
+    detecting runx2a, runx2b or sp7. Osteoblasts at 3 dpf are few and scattered
+    across clusters (the first dermal bones are only starting to ossify).
+  - We also noted that col10a1a and spp1, part of the original osteoblast score,
+    are also expressed by chondrocytes, so bright "osteoblast" regions can be
+    cartilage. Later scores used runx2a/b and sp7 as core genes and tracked
+    cartilage genes (col2a1a, sox9a, matn1, col9a1a) separately.
+
+4.4 Decision
+------------
+Stop trying to isolate the opercle computationally. Instead, look for
+restricted genes among all osteoblasts and let HCR assign patterns to bones.
+These scripts (02, 03) and their outputs are superseded.
+
+
+===============================================================================
+5. DEFINING THE OSTEOBLAST (OB) POPULATION BY CLUSTER (script 04)
+===============================================================================
+
+5.1 Idea
+--------
+Use the authors' existing clusters, and loosely pick the cluster(s) with the
+most osteoblast gene expression, in both RNA and ATAC, at each stage.
+
+5.2 Method
+----------
+RNA "OB index" per cluster = for each OB gene, the fraction of cells detecting
+it (at least one read), averaged over OB genes. Detection fractions are robust
+to sparse markers.
+
+    ob_genes <- c("runx2a", "runx2b", "sp7", "col10a1a", "ifitm5", "abcc6a")
+    cnt <- GetAssayData(rna, assay = "RNA", layer = "counts")
+    det <- (cnt[intersect(ob_genes, rownames(cnt)), ] > 0) * 1
+    ob_index <- colMeans(sapply(split(seq_len(ncol(rna)), rna$RNA_snn_res.0.8),
+                                function(i) Matrix::rowMeans(det[, i])))
+
+ATAC "OB index": detection fractions are meaningless on smoothed imputed data
+(almost everything is slightly nonzero), so instead: mean imputed expression of
+each gene per cluster, z-scored across clusters (so high- and low-expressed
+genes count equally), then averaged over OB genes.
+
+Clusters >= 1.5 SD above the average OB index were suggested; a cartilage index
+flagged possible cartilage contamination.
+
+Correspondence check: RNA and ATAC clusterings were made independently, so we
+correlated every RNA cluster's average profile with every ATAC cluster's (over
+RNA variable genes, each gene z-scored across clusters). The RNA OB cluster's
+best ATAC match should be the ATAC OB cluster.
+
+5.3 Results
+-----------
+5 dpf (clean):
+  - RNA cluster 14: 242 cells; 37% average OB-gene detection vs ~2% in every
+    other cluster (z = 3.2); low cartilage index.
+  - ATAC cluster 2: 405 nuclei; OB index z = 3.0.
+  - RNA cluster 14's best ATAC match: cluster 2. The two independent
+    clusterings agree.
+  - Caveats: RNA OB cells are 217 from replicate 1 and only 25 from replicate 2;
+    the 5 dpf ATAC object has no replicate labels. Reproducibility across
+    replicates cannot be checked.
+
+3 dpf (unreliable):
+  - Selected RNA cluster 2 (806 cells) and ATAC cluster 8 (508 nuclei), but
+    RNA cluster 2 had only ~3% OB-gene detection. It was the least weak
+    cluster, not an OB cluster. 3 dpf was set aside.
+
+Outputs used downstream: data/processed/5dpf_RNA_OB.rds, 5dpf_ATAC_OB.rds
+
+
+===============================================================================
+6. AXES OF VARIATION WITHIN OB NUCLEI (script 05)
+===============================================================================
+
+6.1 Idea
+--------
+Find the main ways OB nuclei differ from each other, using measured chromatin
+to define the structure (avoiding imputation artifacts), then name each axis
+with genes and motifs, and check it in raw RNA.
+
+6.2 Method
+----------
+(a) Recompute the chromatin embedding on OB nuclei only.
+
+LSI (latent semantic indexing) is the ATAC equivalent of PCA:
+  - TF-IDF normalizes each nucleus for its total fragments (TF) and up-weights
+    peaks that are open in only some nuclei (IDF), since peaks open everywhere
+    carry little information.
+  - SVD compresses ~445,000 peaks into ~30 components. Each component is a set
+    of peaks that open together in some nuclei; each nucleus gets a score on it.
+The authors' original LSI separated all cell types; within the OB cluster those
+components barely vary. Recomputing on OB nuclei only finds the axes that vary
+WITHIN OBs.
+
+    aob <- readRDS("data/processed/5dpf_ATAC_OB.rds")
+    DefaultAssay(aob) <- "ATAC"
+    cnt   <- GetAssayData(aob, assay = "ATAC", layer = "counts")
+    peaks <- rownames(cnt)[Matrix::rowSums(cnt > 0) >= ceiling(0.02 * ncol(aob))]
+    aob <- RunTFIDF(aob)
+    aob <- RunSVD(aob, features = peaks, n = 30,
+                  reduction.name = "lsi_ob", reduction.key = "LSIOB_")
+
+    # drop components that mostly track sequencing depth
+    dcor <- cor(Embeddings(aob, "lsi_ob"), log10(aob$nCount_ATAC))[, 1]
+    axes <- which(abs(dcor) <= 0.5)[1:8]
+
+The sign of an LSI component is arbitrary; only the contrast between its two
+ends matters.
+
+(b) Name each axis with genes and motifs: Spearman correlation of every imputed
+gene (and every chromVAR motif score) with each axis.
+
+    gc <- cor(t(as.matrix(imputed[genes, ])), Embeddings(aob, "lsi_ob")[, axes],
+              method = "spearman")
+
+RHO is a rank correlation. Positive rho: the gene is higher at the axis's
+positive end. Negative rho: higher at the negative end. Magnitude = strength.
+
+(c) Annotate each axis by correlating it with summary scores: the landmarks
+(runx2a, sp7, nfatc1, abcc6a), maturation, hox PG2 vs PG3, dorsal vs ventral,
+cell cycle, stress genes, and sequencing depth.
+
+MATURATION score = (mean z-score of late genes sp7, col10a1a, ifitm5, spp1,
+bglap) minus (mean z-score of early genes runx2a, runx2b), per cell, relative
+to the other OB cells. Note runx2a and sp7 are inside this score, so their
+correlations with an axis are not independent of maturation's.
+
+(d) RNA validation by COHERENCE PERMUTATION TEST. For each axis end, take its
+top 25 genes (detected in >= 5% of RNA OB cells). In raw RNA, compute the
+average pairwise correlation among those genes ("coherence"). Compare to 200
+random gene sets with matched expression levels. If the real set co-varies more
+than nearly all random sets (small permutation p), the program exists in real
+measured data, not just in the imputation.
+
+    coherence <- function(mat, genes) {
+      m <- mat[genes, ]; m <- m[apply(m, 1, sd) > 0, ]
+      cc <- cor(t(m)); mean(cc[upper.tri(cc)])
+    }
+    # p = (number of random sets with coherence >= observed + 1) / (n_perm + 1)
+
+With 200 permutations the smallest possible p is 1/201 = 0.005.
+
+6.3 Results
+-----------
+Five axes had one coherent end in RNA (all at the p floor of 0.005):
+
+  Axis (end)    Annotation                     Top genes / interpretation
+  ------------  -----------------------------  --------------------------------
+  LSIOB_2 (-)   cell cycle (rho -0.71),        proliferating progenitors:
+                low stress                     twist2, hmx4, nid2a + biosynthesis
+  LSIOB_3 (-)   less mature, non-cycling       fibroblast/periosteal-like:
+                                               dcn, slit3, efemp2a, fstb
+                                               (also krt4: possible contamination)
+  LSIOB_4 (+)   coherence 0.19, 4x others      ribosomal proteins (technical)
+                                               + col12a1a, matn4, angptl1a
+  LSIOB_5 (+)   less mature, ventral bias      stromal-like: cebpd, nfia, mfap2
+  LSIOB_6 (-)   weak depth link                housekeeping (technical)
+
+Other observations:
+  - For axes with the coherent module at the negative end, the program's
+    relationship to each annotation is the opposite sign of the rho shown.
+  - The two ends of each axis did NOT anticorrelate in RNA (cor_pos_vs_neg near
+    zero). These are single programs "on" in some cells, not two competing
+    programs.
+  - Landmark associations mostly failed to replicate. Example: axis 2 correlated
+    with runx2a at 0.74, sp7 0.53, nfatc1 -0.36 in imputed data, but |r| < ~0.16
+    in RNA, some with opposite signs. Partly expected (imputation inflates,
+    single-gene dropout deflates), but it means landmarks cannot yet be used to
+    place axes spatially.
+
+
+===============================================================================
+7. RECLUSTERING OB NUCLEI TWO WAYS (script 06)
+===============================================================================
+
+7.1 Idea
+--------
+Group the 405 OB nuclei into subclusters in two independent ways and see which
+groups both methods find.
+
+  A. Chromatin clustering: group nuclei by similarity of measured open
+     chromatin, using the OB-only LSI from script 05.
+  B. Imputed-expression clustering: group nuclei by imputed expression
+     (2,000 most variable genes, ribosomal/mitochondrial excluded, cell-cycle
+     score regressed out), using PCA.
+
+Groups found both ways are supported by two kinds of evidence (chromatin is
+measured directly; imputed expression is borrowed from RNA).
+
+7.2 Method
+----------
+Clustering works the same way for both (only the input components differ):
+build a nearest-neighbor graph connecting each nucleus to its most similar
+nuclei, then find densely connected communities. RESOLUTION controls how
+finely it splits.
+
+    # A. chromatin
+    aob <- FindNeighbors(aob, reduction = "lsi_ob", dims = axes,
+                         graph.name = c("chrom_nn", "chrom_snn"))
+    aob <- FindClusters(aob, graph.name = "chrom_snn", algorithm = 3, resolution = 0.5)
+
+    # B. imputed expression
+    DefaultAssay(aob) <- "ACTIVITY"
+    aob <- ScaleData(aob, features = hvg, vars.to.regress = "cc_score")
+    aob <- RunPCA(aob, features = hvg, reduction.name = "pca_imp")
+    aob <- FindNeighbors(aob, reduction = "pca_imp", dims = 1:15,
+                         graph.name = c("imp_nn", "imp_snn"))
+    aob <- FindClusters(aob, graph.name = "imp_snn", resolution = 0.5)
+
+Agreement measured by ADJUSTED RAND INDEX (ARI): over all pairs of cells, how
+often both partitions agree on "same group" vs "different group", corrected for
+chance. 1 = identical, 0 = no better than random.
+
+Each subcluster was characterized by an annotation heatmap, marker genes
+(FindAllMarkers on imputed expression), enriched motifs, and the RNA coherence
+test on its top 20 markers (500 permutations).
+
+7.3 Results: resolution sweep
+-----------------------------
+  Resolution   Chromatin (smallest)   Imputed (smallest)   ARI
+  0.3          4 (22)                 5 (63)               0.33
+  0.5 (used)   6 (22)                 7 (25)               0.26
+  0.8          7 (22)                 8 (20)               0.26
+  1.0          8 (18)                 9 (20)               0.26
+
+  - Agreement is best at the coarsest resolution and flat beyond it: the shared
+    structure is about 4-5 groups.
+  - No plateau in cluster number: the population is partly continuous
+    (gradients) with a few distinct groups.
+  - A stable 22-nucleus chromatin group appears at every resolution but is not
+    coherent in RNA (generic genes).
+
+7.4 Results: groups found in both partitions
+--------------------------------------------
+  Group                 Chromatin   Imputed     RNA check         Markers
+  --------------------  ----------  ----------  ----------------  ----------------
+  Mature osteoblasts    4 (56)      1 (72)      strongly          col10a1a, ifitm5,
+                                                coherent          panx3, bgna,
+                                                (0.12-0.14,       col11a2, bmp8a,
+                                                p = 0.002)        slc8a4b, cd81b
+  Keratin/vimentin      3 (59)      0 (90)      coherent          krt4, krt91, vim,
+                                                (p = 0.002)       ifitm1, efemp2a, fstb
+  Tendon/ligament/      0 (124)     5 (41) +    not coherent      scxa, lum, mafa,
+  perichondrium-like                6 (25)                        matn4, foxo1a, nog1,
+                                                                  sox6, aspn
+  Proliferating/        1, 5        2, 3, 4     not coherent      pcna, rbbp4,
+  generic                                                         housekeeping
+  Positional            2 (67)      (split)     not coherent      hmx4, hand2, cdon
+
+Interpretation:
+  - MATURE OSTEOBLASTS are the most solid result. Note enam and scpp1 (tooth
+    genes) in the chromatin version: some odontoblasts may be included. slc8a4b
+    has been reported (UW thesis, HCR) as centrally expressed in the 3 dpf
+    opercle relative to runx2b/sp7. Since intramembranous bones grow at their
+    edges, maturation is itself a spatial axis: mature = center, immature =
+    edges.
+  - KERATIN group: epidermal keratins should not be in neural crest osteoblasts;
+    likely doublets with epidermal cells or ambient RNA. It overlaps the script
+    05 axis 3 program, so part of that program may be contamination.
+  - TENDON/PERICHONDRIUM-like group matches the paper's hyal4+ perichondrium ->
+    periosteum/tendon/ligament lineage, and is relevant to enthesis work. Its
+    failed RNA check is probably not evidence against it: the check uses only
+    RNA cluster 14, while these cells are likely in a different RNA cluster.
+    Needs testing in the full 5 dpf RNA dataset.
+
+
+===============================================================================
+8. "CORE + PARTNER" GENES (script 07)   [results not yet reviewed]
+===============================================================================
+
+8.1 Idea
+--------
+Observation from heatmaps: many interesting genes are high in the mature OB
+subcluster AND one other specific subcluster, but low elsewhere. Such genes
+could be:
+  - regional (positional) genes, shared by different cell types in the same
+    location (cell-type genes are restricted to one type; positional genes are
+    shared across types in a region),
+  - genes of an interface (e.g., bone and attached connective tissue),
+  - or artifacts (imputation bleeding between neighboring subclusters; doublets).
+
+8.2 Method
+----------
+For every gene: mean imputed expression per subcluster. For each possible
+partner subcluster k, build a template (1 for core and k, 0 elsewhere) and
+correlate the gene's profile with it; keep the best partner. Then require:
+  - separation: core and partner both above every other subcluster,
+  - balance:    the weaker of core/partner >= 40% of the stronger,
+  - cell-level Wilcoxon tests: core > rest and partner > rest,
+and record RNA detection and correlation with the mature-OB program in RNA.
+Run on both partitions; genes passing in both are most robust.
+
+    Tm <- sapply(partners, function(k) as.numeric(clusters %in% c(core, k)))
+    R  <- cor(t(Z), Tm)          # Z = gene x subcluster means, z-scored per gene
+    best_partner <- partners[max.col(R)]
+
+Output: results/core_partner/5dpf/core_partner_both_partitions.csv
+
+
+===============================================================================
+9. GENE MODULES WITHIN MATURE OSTEOBLASTS (script 08)
+===============================================================================
+
+9.1 Idea
+--------
+Focus only on mature osteoblasts (the most reliable group) and ask: which genes
+are switched on in only SOME mature cells, in a coordinated way? That is the
+closest single-cell analog of an SRG.
+
+9.2 Method
+----------
+Mature nuclei = in chromatin subcluster 4 AND imputed subcluster 1: 47 nuclei.
+Too few to recluster reliably, so we looked for gene MODULES: groups of genes
+that rise and fall together across cells.
+
+  1. (Regressed run) Remove the effects of maturation, cell cycle and depth
+     from each gene by linear regression, keeping the residual variation.
+  2. Take the 400 most variable genes.
+  3. Correlate every pair of genes (Spearman).
+  4. Hierarchically cluster genes by (1 - correlation); cut the tree at 0.6.
+  5. Keep branches with >= 8 genes: modules M1, M2, ... by size.
+
+    R  <- X - (X %*% C) %*% solve(crossprod(C), t(C))   # residuals; C = covariates
+    cg <- cor(t(R[top_genes, ]), method = "spearman")
+    hc <- hclust(as.dist(1 - cg), method = "average")
+    modules <- cutree(hc, h = 0.6)
+
+Per module:
+  - module score per cell (mean z-score of its genes),
+  - restriction: frac_cells_high (fraction of cells with score > 1 SD) and
+    skewness (positive = on in a minority of cells),
+  - hub genes: genes most correlated with the module score (kME),
+  - annotation correlations and motif correlations,
+  - RNA coherence test in RNA "mature-like" cells (top 50% by mature score)
+    and in all RNA OB cells (500 permutations).
+
+9.3 Results (regressed run)
+---------------------------
+  Module  Genes  Hub genes                         Interpretation
+  ------  -----  --------------------------------  ---------------------------------
+  M1      164    sypa, snap25a, nsfa, atp6v0cb     neuronal genes in ~5 nuclei,
+                                                   depth-linked (r 0.44): possible
+                                                   doublets with neurons
+  M2      65     col11a2, col10a1a, sparc, ifitm5  mature OB program (residual
+                                                   maturation, rho 0.50)
+  M3      43     eef1g, faua, tpt1, uba52          translation machinery (technical)
+  M4      31     hsp70, fosab, fosb, gadd45ba      dissociation stress (rho 0.91)
+  M5      19     fabp3, atp5fa1, mdh1aa, histones  metabolism/housekeeping
+  M6      15     col1a1b, fstl3, jun, serpine1     bone matrix genes mixed with stress
+  M7      13     serpinf1, itga10, krt18, egr1     interesting OB genes mixed with
+                                                   stress (rho 0.73)
+  M8      8      thbs4b, cxcl12a, rbp4, ptgdsb.1   stromal/tendon genes in ~6 nuclei,
+                                                   depth-linked (r 0.62): possible
+                                                   doublets or interface cells
+
+Key observations:
+  - Restricted modules (M1, M8) carry another cell type's genes in a few
+    depth-rich nuclei: the classic doublet signature, but this was inferred, not
+    tested with a doublet-detection tool. M8 could also be real interface cells.
+  - Stress confounds the imputed landmark correlations (nfatc1 and sp7 correlate
+    0.56-0.73 with stress modules M4 and M7).
+  - No clean, restricted, non-technical module yet. With 47 nuclei, any finer
+    spatial program is weak compared with technical variation.
+
+In progress: an unregressed run (regress_vars <- character(0)) to see the raw
+structure, with no doublet exclusion.
+
+
+===============================================================================
+10. OVERALL CONCLUSIONS
+===============================================================================
+
+1. The clearest spatial axis is MATURATION. In growing intramembranous bone,
+   mature osteoblasts are central and immature cells are at growing edges.
+   Mature-OB markers (ifitm5, panx3, col10a1a, slc8a4b) are strong candidates
+   for center-restricted expression.
+
+2. The 5 dpf OB cluster includes NEIGHBORING CELL TYPES, especially a
+   tendon/ligament/perichondrium-like group (scxa, lum, mafa, matn4). Spatially
+   these would sit at bone margins and attachment sites.
+
+3. WITHIN mature osteoblasts, technical variation (stress, translation, depth,
+   possible doublets) dominates at this sample size. Any finer spatial program
+   is not yet distinguishable from it.
+
+4. IMPUTED DATA ORGANIZES BUT DOES NOT CREATE expression information. Patterns
+   in imputed data need confirmation in raw RNA, and the RNA check is limited by
+   small cell numbers (242 RNA OB cells, 217 from one replicate).
+
+5. 3 dpf has too few osteoblasts for these analyses on its own.
+
+
+===============================================================================
+11. CURRENT HCR CANDIDATE GENES
+===============================================================================
+
+Stronger:
+  - Mature / predicted central: ifitm5, panx3, col10a1a, slc8a4b
+      pair with sp7 (and runx2a as an immature/edge reference)
+  - Margin / attachment: scxa, lum, mafa, matn4
+      pair with sp7 and nfatc1 (pending full-RNA check)
+
+Weaker leads (need confounders resolved):
+  - serpinf1, itga10, col1a1b, fstl3 (entangled with stress)
+  - dcn, slit3, fstb (possibly keratin-group contamination)
+  - cebpd, mfap2, nfia (stromal-like, axis 5)
+  - twist2, hmx4 (entangled with cell cycle)
+
+Suggested HCR design: probe one gene from each candidate program together with
+the landmark it is predicted to relate to, so each experiment tests whether two
+programs occupy different regions, not just whether a gene is expressed.
+
+
+===============================================================================
+12. OPEN ITEMS AND NEXT STEPS
+===============================================================================
+
+  - Full 5 dpf RNA check for the tendon/perichondrium group:
+
+        rna5 <- UpdateSeuratObject(readRDS("data/raw/5dpf_scRNA.rds"))
+        DotPlot(rna5, features = c("scxa", "lum", "mafa", "matn4", "foxo1a", "nog1",
+                                   "col10a1a", "ifitm5", "sp7", "runx2a", "nfatc1"),
+                group.by = "RNA_snn_res.0.8") + RotatedAxis()
+
+  - Review script 07 (core + partner) results.
+  - Review the ihha heatmap (and Hh targets ptch1, ptch2, gli1).
+  - Unregressed run of script 08.
+  - Optional:
+      * formal doublet detection with scDblFinder on the whole 5 dpf ATAC peak
+        matrix (AMULET would need fragment files, which we do not have);
+      * overlap with the voxel-atlas SRG list (data/reference/atlas_srgs.txt);
+      * gene-set enrichment (GO) for modules;
+      * consensus NMF (cNMF) or cisTopic as more principled program-discovery
+        methods;
+      * revisit 3 dpf by projecting cells onto the 5 dpf OB definition.
+
+
+===============================================================================
+13. FILE MAP
+===============================================================================
+
+Scripts (scripts/):
+  01_pseudomultiome_3dpf.R          inspect ACTIVITY assay; plot markers
+  02_opercle_osteo_subset.R         per-cell opercle gates            [superseded]
+  03_opercle_cluster_selection.R    osteo-cell subclustering          [superseded]
+  04_define_ob_clusters.R           OB clusters per stage, RNA-ATAC correspondence
+  05_ob_axes_5dpf.R                 OB-only LSI axes, genes, motifs, RNA validation
+  06_recluster_atac_ob.R            chromatin vs imputed subclusters
+  07_core_plus_partner_genes.R      core + partner gene search
+  08_mature_ob_srg_modules.R        modules within mature OBs
+
+Processed data (data/processed/):
+  5dpf_RNA_OB.rds, 5dpf_ATAC_OB.rds       OB cluster subsets (script 04)  USE
+  5dpf_ATAC_OB_axes.rds                   + OB-only LSI (script 05)
+  5dpf_ATAC_OB_reclustered.rds            + both subclusterings (script 06)  USE
+  5dpf_ATAC_mature_OB_modules.rds         mature nuclei + module scores (script 08)
+  *_opercle_osteo_candidates.rds,
+  *_osteo_subclustered.rds,
+  3dpf_pseudomultiome.rds                 superseded (scripts 01-03)
+
+Results (results/): ob_axes/, ob_recluster/, core_partner/, mature_srg/ and
+matching folders under results/figures/.
+
+
+===============================================================================
+14. GLOSSARY
+===============================================================================
+
+Anchor           A pair of an RNA cell and an ATAC nucleus judged to be the same
+                 kind of cell; used to transfer expression between datasets.
+ARI              Adjusted Rand Index: agreement between two clusterings,
+                 corrected for chance (1 identical, 0 random).
+ATAC-seq         Assay for transposase-accessible chromatin: maps open DNA.
+chromVAR         Method scoring, per nucleus, whether peaks containing a given
+                 transcription factor motif are more open than expected.
+Cluster /        A group of cells more similar to each other than to the rest,
+subcluster       found by community detection on a nearest-neighbor graph.
+Coherence        Average pairwise correlation among a gene set's members across
+                 cells; high = the genes co-vary like a real program.
+Doublet          Two cells captured together and sequenced as one; shows mixed
+                 identities and often more reads/fragments.
+Dropout          A gene expressed in a cell but not detected (zero reads), common
+                 for lowly expressed genes in scRNA-seq.
+Hub gene / kME   A gene highly correlated with its module's overall score; the
+                 most representative member.
+Imputation       Estimating missing values; here, assigning RNA-derived
+                 expression to ATAC nuclei.
+LSI              Latent semantic indexing (TF-IDF + SVD): dimensionality
+                 reduction for ATAC data, analogous to PCA for RNA.
+Module           A group of genes that rise and fall together across cells.
+Module score     Per-cell summary of a module/gene set (average of z-scored or
+                 background-corrected expression).
+Peak             A genomic region found to be open in some cells.
+Permutation p    Fraction of random comparison sets that score at least as high
+                 as the real one; small = unlikely by chance.
+Pseudo-multiome  ATAC nuclei carrying imputed expression, approximating a dataset
+                 where both were measured in the same cell.
+Regression       Removing the part of each gene's variation explained by a
+(of covariates)  covariate (e.g., stress, depth), leaving residual variation.
+Resolution       Clustering parameter; higher = more, smaller clusters.
+Rho (Spearman)   Rank correlation, -1 to 1; sign tells direction, magnitude
+                 tells strength.
+SRG              Spatially restricted gene: expressed in a restricted spatial
+                 domain (defined from imaging; here only predicted).
+TF-IDF           Normalization for ATAC: corrects for depth and up-weights peaks
+                 open in only some cells.
+UMAP             2D visualization of high-dimensional data; for viewing only,
+                 not used to define clusters.
+Z-score          (value - mean) / SD. In gene x cluster heatmaps it is computed
+                 per gene across clusters, so colors show where a gene is
+                 relatively high, and cannot be compared between genes.
